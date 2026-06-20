@@ -1,0 +1,61 @@
+# ---------- Genel ----------
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.swp
+.idea/
+.vscode/
+*.code-workspace
+
+# ---------- Backend (Python) ----------
+backend/.venv/
+backend/__pycache__/
+backend/**/__pycache__/
+backend/*.pyc
+backend/*.pyo
+backend/.pytest_cache/
+backend/.mypy_cache/
+backend/.ruff_cache/
+backend/data/uploads/
+backend/data/chroma/
+backend/uvi*.log
+backend/uvi*.err
+backend/uvi*.out
+backend/uvicorn*.log
+backend/uvicorn*.err
+backend/uvicorn*.out
+backend/test_openrouter.py
+backend/test_or.py
+
+# ---------- Frontend (Next.js / Node) ----------
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/build/
+frontend/dist/
+frontend/.turbo/
+frontend/coverage/
+frontend/.env
+frontend/.env.local
+frontend/.env*.local
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+frontend/pnpm-debug.log*
+frontend/next.log
+frontend/next.err
+frontend/next.out
+
+# ---------- Secrets (her ihtimale karsi) ----------
+.env
+.env.local
+.env.*.local
+backend/.env
+**/.env
+!**/.env.example
+
+# ---------- Uploads / runtime veri ----------
+**/uploads/
+**/chroma/
+**/data/
