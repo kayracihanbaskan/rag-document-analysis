@@ -15,7 +15,13 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <nav className="sticky top-0 z-50 glass border-b border-border">
           <div className="mx-auto flex max-w-5xl items-center justify-between px-6 py-3">
             <Link href="/" className="flex items-center gap-2 group">
-              <span className="inline-block h-7 w-7 rounded-lg bg-gradient-to-br from-[var(--accent)] to-[var(--accent-2)] transition-transform group-hover:rotate-12" />
+              <img
+                src="/images/logo.svg"
+                alt="RAG Docs"
+                width={28}
+                height={28}
+                className="h-7 w-7 transition-transform group-hover:rotate-12"
+              />
               <span className="font-semibold tracking-tight">RAG Docs</span>
             </Link>
             <div className="flex gap-1 text-sm">
