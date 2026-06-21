@@ -1,164 +1,209 @@
 # RAG Document Analysis
 
-PDF dökümanlarını yükleyip içerikleri hakkında Türkçe soru sorabileceğin, kaynak referanslarıyla birlikte yanıt alabileceğin bir **Retrieval-Augmented Generation (RAG)** uygulaması.
+> Retrieval-Augmented Generation pipeline for PDF documents. Upload a PDF, ask questions in Turkish, get answers grounded in source chunks with page references.
 
-![Stack](https://img.shields.io/badge/python-3.11-3776AB?logo=python&logoColor=white)
-![Stack](https://img.shields.io/badge/next.js-15-000000?logo=nextdotjs)
-![Stack](https://img.shields.io/badge/fastapi-0.115-009688?logo=fastapi)
-![Stack](https://img.shields.io/badge/license-MIT-green)
+A production-shaped RAG service built to study real-world trade-offs: async ingestion queues, local embeddings, vector persistence, streaming LLM responses, and multi-platform deployment.
 
 ---
 
-## ✨ Özellikler
+## Overview
 
-- 📄 **PDF ingestion** — `pymupdf` ile dijital PDF'lerden metin çıkarımı
-- ✂️ **Recursive chunking** — paragraf → cümle → kelime öncelikli karakter bölücü
-- 🧠 **Lokal embedding** — `BAAI/bge-small-en-v1.5` (sentence-transformers, ücretsiz, çevrimdışı)
-- 🗄️ **Vector store** — `ChromaDB` (kalıcı, HNSW + cosine)
-- 🤖 **LLM** — OpenRouter üzerinden `openai/gpt-4o-mini` (streaming, SSE)
-- ⚡ **Backend** — FastAPI + async endpoints
-- 🎨 **Frontend** — Next.js 15 + React 19 + Tailwind + Framer Motion (glassmorphism, animasyonlu)
-- 📎 **Kaynak şeffaflığı** — Her yanıtta sayfa numarası, chunk metni ve cosine skoru gösterilir
-
----
-
-## 🏗️ Mimari
+The system answers natural-language questions about a user's uploaded PDFs. It does not hallucinate freely — every answer is grounded in retrieved chunks, and the user can inspect which page and passage each citation came from.
 
 ```
-┌──────────────┐   HTTP    ┌──────────────────┐   OpenAI SDK   ┌────────────┐
-│   Next.js    │ ────────▶ │   FastAPI        │ ─────────────▶ │ OpenRouter │
-│  (port 3000) │  /api/    │   (port 8000)    │                │  gpt-4o    │
-│              │  backend  │                  │                └────────────┘
-│  - Upload UI │           │  - PDF parser    │
-│  - Chat UI   │           │  - Chunker       │
-│  - Doc select│           │  - Embedder      │   sentence-    ┌────────────┐
-│              │           │  - RAG service   │ ─transformers─▶│ Chroma     │
-│              │           │  - LLM client    │                │ (./data)   │
-└──────────────┘           └──────────────────┘                └────────────┘
+                                +-------------------+
+       +----------+    HTTP     |     FastAPI       |   OpenAI SDK    +------------+
+       |  Next.js | -----------> |  (uvicorn: 8000)  | ---------------> | OpenRouter |
+       | (3000)   |   /api/      |                   |                  |  gpt-4o-mini|
+       +----------+   backend    |  /documents/*     |                  +------------+
+            |                    |  /jobs/{id}       |
+            | SSE chat           |  /chat/stream     |   sentence-      +-----------+
+            v                    |                   | --transformers->|  Chroma   |
+       +----------+              |  worker:          |                  |  (volume) |
+       |  Browser | <----------- |  Celery (CPU)     |                  +-----------+
+       +----------+    job poll  |                   |
+                                +-------------------+
 ```
 
-### Akış: Soru sorma
+### Pipeline
 
-1. Kullanıcı soru yazar → `POST /api/chat` (Next.js)
-2. Next.js SSE proxy → `POST /documents/chat/stream` (FastAPI)
-3. Backend soruyu BGE ile embed eder
-4. Chroma'dan top-K=5 en yakın chunk çekilir
-5. System prompt + bağlam + soru → OpenRouter
-6. `event: sources` (kaynaklar), `event: token` × N, `event: done` → frontend
+**Ingestion (async via Celery + Redis):**
+1. `POST /documents/upload` saves the PDF and returns `202 Accepted` with a `job_id` immediately.
+2. A Celery worker picks up the task, parses pages with `pymupdf`, splits with `RecursiveCharacterTextSplitter`, embeds with `BAAI/bge-small-en-v1.5`, and writes vectors to Chroma with `document_id` metadata.
+3. The frontend polls `GET /jobs/{id}` for progress.
 
-### Akış: PDF yükleme
-
-1. `POST /documents/upload` (multipart/form-data)
-2. PDF → `pymupdf` → sayfa metinleri
-3. `RecursiveCharacterTextSplitter` (chunk_size=800, overlap=120)
-4. BGE-small ile batch embedding
-5. Chroma'ya `document_id` metadata'sıyla yaz
+**Retrieval + generation (sync, SSE):**
+1. Question is embedded with the same BGE model.
+2. Top-K (default 5) chunks are fetched from Chroma, optionally filtered by `document_id`.
+3. Chunks are formatted into a context block; a system prompt instructs the model to answer only from the context.
+4. OpenRouter streams tokens back to the client over Server-Sent Events with three event types: `sources`, `token`, `done`.
 
 ---
 
-## 📦 Dizin yapısı
+## Tech stack
+
+| Layer            | Choice                              | Why                                                 |
+|------------------|-------------------------------------|-----------------------------------------------------|
+| Backend          | FastAPI 0.115, Python 3.11          | Async, type-safe, OpenAPI built-in                  |
+| Job queue        | Celery 5 + Redis 7                  | Decouples ingestion from request lifecycle          |
+| PDF parsing      | `pymupdf`                           | Fast, no system deps, handles digital PDFs          |
+| Chunking         | `RecursiveCharacterTextSplitter`    | Language-agnostic, predictable boundaries           |
+| Embeddings       | `BAAI/bge-small-en-v1.5` (local)    | 120 MB, multilingual, no API cost                   |
+| Vector store     | ChromaDB (HNSW + cosine)            | Zero-config, persistent, metadata filtering         |
+| LLM              | OpenRouter `openai/gpt-4o-mini`     | OpenAI-compatible API, flexible model selection     |
+| Frontend         | Next.js 15 (App Router), React 19   | Streaming SSE proxy, server-side rewrite to backend |
+| Styling          | Tailwind + Framer Motion            | Glassmorphism, smooth state transitions             |
+
+---
+
+## Project layout
 
 ```
 rag-document-analysis/
 ├── backend/
 │   ├── app/
-│   │   ├── main.py              # FastAPI app
-│   │   ├── core/config.py       # Pydantic Settings
-│   │   ├── api/documents.py     # 4 endpoint
-│   │   ├── schemas/documents.py # Pydantic modeller
+│   │   ├── main.py                # FastAPI app
+│   │   ├── celery_app.py          # Celery configuration
+│   │   ├── core/config.py         # Pydantic Settings
+│   │   ├── api/documents.py       # HTTP endpoints
+│   │   ├── schemas/documents.py   # Request/response models
+│   │   ├── tasks/ingestion.py     # Celery ingestion task
 │   │   └── services/
-│   │       ├── pdf_parser.py    # pymupdf
-│   │       ├── chunker.py       # Recursive splitter
-│   │       ├── embedder.py      # BGE-small
-│   │       ├── llm.py           # OpenRouter
-│   │       ├── vector_store.py  # Chroma adapter
-│   │       ├── ingestion.py     # PDF → DB pipeline
-│   │       └── rag.py           # retrieve → prompt → generate
-│   ├── data/                    # uploads + chroma (gitignored)
+│   │       ├── pdf_parser.py      # pymupdf
+│   │       ├── chunker.py         # Recursive splitter
+│   │       ├── embedder.py        # BGE-small
+│   │       ├── llm.py             # OpenRouter
+│   │       ├── vector_store.py    # Chroma adapter
+│   │       ├── ingestion.py       # PDF → DB pipeline
+│   │       └── rag.py             # retrieve → prompt → generate
+│   ├── data/                      # uploads + chroma (gitignored)
 │   ├── pyproject.toml
 │   ├── requirements.txt
+│   ├── Dockerfile
 │   └── .env.example
-└── frontend/
-    ├── src/
-    │   ├── app/
-    │   │   ├── page.tsx         # Landing
-    │   │   ├── layout.tsx       # Nav + global bg
-    │   │   ├── documents/       # Upload (drag&drop)
-    │   │   ├── chat/            # Sohbet
-    │   │   └── api/chat/        # SSE proxy
-    │   ├── components/
-    │   └── lib/
-    │       ├── api.ts           # Backend client
-    │       ├── storage.ts       # localStorage doc listesi
-    │       └── types.ts
-    ├── package.json
-    ├── tailwind.config.ts
-    ├── tsconfig.json
-    └── .env.example
+├── frontend/
+│   ├── src/
+│   │   ├── app/
+│   │   │   ├── page.tsx           # Landing
+│   │   │   ├── layout.tsx         # Nav + global styles
+│   │   │   ├── documents/         # Drag & drop + async progress
+│   │   │   ├── chat/              # SSE chat with source drawer
+│   │   │   └── api/chat/          # Next → backend SSE proxy
+│   │   └── lib/
+│   │       ├── api.ts             # Backend client
+│   │       ├── storage.ts         # localStorage document list
+│   │       └── types.ts
+│   ├── public/images/logo.svg
+│   ├── package.json
+│   ├── tailwind.config.ts
+│   └── .env.example
+├── docker-compose.yml             # Redis + backend + worker
+├── .env.example
+└── README.md
 ```
 
 ---
 
-## 🚀 Kurulum
+## Quick start
 
-### Önkoşullar
+### Option A: Docker (recommended)
 
-- **Python 3.11** (3.14'te `pymupdf`/`chromadb` wheel yok)
-- **Node.js 18.18+** (20.x önerilir)
-- OpenRouter hesabı ve API key → https://openrouter.ai/keys
+Single-command stack with Redis, backend API, and Celery worker. Frontend runs locally with `npm run dev` for fast iteration.
 
-### 1. Backend
+Prerequisites: Docker Desktop, Node.js 20+, an OpenRouter API key.
 
 ```powershell
+# 1. Configure secrets
+copy .env.example .env
+# Edit .env and paste your OPENROUTER_API_KEY
+
+# 2. Start Redis + backend + worker
+docker compose up --build
+
+# 3. In a second terminal, start the frontend
+cd frontend
+npm install
+copy .env.example .env.local
+npm run dev
+
+# 4. Open
+#    http://localhost:3000     (frontend)
+#    http://localhost:8000/docs (API docs)
+```
+
+First build pulls `python:3.11-slim`, `node:20-alpine`, `redis:7-alpine` and downloads the BGE model (~120 MB). Expect 3-5 minutes on a cold cache; subsequent restarts take seconds.
+
+Data persistence: Chroma vectors and uploaded PDFs live in the `rag-data` named volume. Survives container restarts. Remove with `docker compose down -v`.
+
+### Option B: Manual (no Docker)
+
+Four terminals, one for each process.
+
+```powershell
+# Terminal 1 - Redis
+# Install from https://github.com/microsoftarchive/redis/releases or use WSL
+redis-server
+
+# Terminal 2 - Backend
 cd backend
 py -3.11 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-copy .env.example .env
-# .env icindeki OPENROUTER_API_KEY'i doldur
-```
+copy .env.example .env   # fill in OPENROUTER_API_KEY
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --port 8000
 
-### 2. Frontend
+# Terminal 3 - Celery worker
+cd backend
+.\.venv\Scripts\python.exe -m celery -A app.celery_app worker --loglevel=info --concurrency=1
 
-```powershell
+# Terminal 4 - Frontend
 cd frontend
 npm install
 copy .env.example .env.local
-# .env.local: BACKEND_URL=http://127.0.0.1:8000
-```
-
-### 3. Çalıştırma (3 ayrı terminal)
-
-**Terminal 1 — Backend**
-```powershell
-cd backend
-.\.venv\Scripts\python.exe -m uvicorn app.main:app --reload --port 8000
-```
-
-**Terminal 2 — Frontend**
-```powershell
-cd frontend
 npm run dev
 ```
 
-**Tarayıcı:** http://localhost:3000
-
-İlk açılışta BGE-small modeli HuggingFace cache'inden indirilir (~120 MB, 1-2 dk). Sonraki açılışlarda anında yüklenir.
+For local development without Redis, set `CELERY_EAGER=true` in `backend/.env` to run ingestion synchronously inside the API process. Do not use this in production.
 
 ---
 
-## 🔌 API
+## API
 
-| Method | Path                       | Açıklama                                |
-|--------|----------------------------|-----------------------------------------|
-| `GET`  | `/health`                  | Health check                            |
-| `POST` | `/documents/upload`        | PDF yükle (multipart, `file` field)     |
-| `GET`  | `/documents/search?q=...`  | Metin sorgusu, top-K chunk döner        |
-| `POST` | `/documents/chat`          | Tam yanıt (kaynak dahil)                |
-| `POST` | `/documents/chat/stream`   | SSE streaming: `sources` → `token` × N → `done` |
-| `GET`  | `/docs`                    | Swagger UI                              |
+| Method | Path                          | Description                                                |
+|--------|-------------------------------|------------------------------------------------------------|
+| GET    | `/health`                     | Liveness check                                             |
+| POST   | `/documents/upload`           | Multipart upload, returns `202` with `job_id`              |
+| GET    | `/jobs/{job_id}`              | Poll ingestion progress (`PENDING`/`PROGRESS`/`SUCCESS`)   |
+| GET    | `/documents/search?q=...`     | Top-K similar chunks (debugging)                           |
+| POST   | `/documents/chat`             | Sync RAG answer with sources                               |
+| POST   | `/documents/chat/stream`      | SSE streaming chat (`sources` → `token` × N → `done`)      |
 
-### SSE Event Formatı
+### Upload flow
+
+```http
+POST /documents/upload
+Content-Type: multipart/form-data
+
+file=@document.pdf
+```
+
+Response (`202 Accepted`):
+```json
+{
+  "job_id": "a1b2c3-...",
+  "document_id": "uuid",
+  "filename": "document.pdf",
+  "status_url": "/jobs/a1b2c3-..."
+}
+```
+
+Poll the status URL:
+```json
+{ "job_id": "...", "state": "PROGRESS", "stage": "parse + chunk + embed", "percent": 30 }
+{ "job_id": "...", "state": "SUCCESS", "result": { "document_id": "...", "pages": 12, "chunks": 87 } }
+```
+
+### SSE event format
 
 ```
 event: sources
@@ -176,54 +221,66 @@ data: {}
 
 ---
 
-## ⚙️ Konfigürasyon (backend `.env`)
+## Configuration
 
-| Değişken                  | Varsayılan                  | Açıklama                              |
-|---------------------------|-----------------------------|---------------------------------------|
-| `OPENROUTER_API_KEY`      | —                           | OpenRouter key (zorunlu)              |
-| `OPENROUTER_BASE_URL`     | `https://openrouter.ai/api/v1` | API base                            |
-| `LLM_MODEL`               | `openai/gpt-4o-mini`        | OpenRouter model ID                   |
-| `BGE_MODEL_NAME`          | `BAAI/bge-small-en-v1.5`    | sentence-transformers model adı       |
-| `BGE_DEVICE`              | `cpu`                       | `cpu` veya `cuda`                     |
-| `BGE_BATCH_SIZE`          | `16`                        | Embedding batch boyutu                |
-| `CHUNK_SIZE`              | `800`                       | Karakter cinsinden chunk boyutu       |
-| `CHUNK_OVERLAP`           | `120`                       | Chunk'lar arası örtüşme               |
-| `CHROMA_PERSIST_DIR`      | `./data/chroma`             | Chroma kalıcılık dizini               |
-| `MAX_UPLOAD_MB`           | `20`                        | Maks PDF boyutu                       |
+All settings are read from environment variables, typically loaded from `backend/.env`.
 
----
-
-## 🛠️ Teknoloji seçimlerinin gerekçeleri
-
-- **BGE-small (yerine BGE-M3)**: M3 ~2.3 GB indirme + ~5-15 dk sürüyordu. Small ~120 MB, 1-2 dk. Türkçe kalitesi M3'e göre düşük ama başlangıç için yeterli. İleride tek satır config ile `intfloat/multilingual-e5-base`'e geçilebilir.
-- **OpenRouter (yerine doğrudan OpenAI)**: OpenAI bakiyesi bittiğinde bakiye yüklemeden farklı modelleri denemek için. Aynı OpenAI SDK, sadece `base_url` değişiyor.
-- **Chroma (yerine Qdrant/Pinecone)**: Tamamen ücretsiz, lokal, sıfır devops. Production scale'e geçerken Qdrant self-host'a migration basit.
-- **Recursive splitter (yerine semantik)**: Dil-bağımsız, hızlı, yeterli kalite. Semantik chunking için LlamaIndex `SemanticSplitter` eklenebilir.
-- **SSE (yerine WebSocket)**: Tek yönlü iletişim için yeterli, altyapı sadeleşiyor.
+| Variable                          | Default                              | Notes                          |
+|-----------------------------------|--------------------------------------|--------------------------------|
+| `OPENROUTER_API_KEY`              | (required)                           | LLM API key                    |
+| `OPENROUTER_BASE_URL`             | `https://openrouter.ai/api/v1`       |                                |
+| `LLM_MODEL`                       | `openai/gpt-4o-mini`                 | Any OpenRouter model ID        |
+| `BGE_MODEL_NAME`                  | `BAAI/bge-small-en-v1.5`             | Any sentence-transformers model |
+| `BGE_DEVICE`                      | `cpu`                                | `cpu` or `cuda`                |
+| `BGE_BATCH_SIZE`                  | `16`                                 |                                |
+| `CHUNK_SIZE`                      | `800`                                | Character count                |
+| `CHUNK_OVERLAP`                   | `120`                                |                                |
+| `CHROMA_PERSIST_DIR`              | `./data/chroma`                      |                                |
+| `MAX_UPLOAD_MB`                   | `20`                                 |                                |
+| `CELERY_BROKER_URL`               | `redis://127.0.0.1:6379/0`           |                                |
+| `CELERY_RESULT_BACKEND`           | `redis://127.0.0.1:6379/1`           |                                |
+| `CELERY_EAGER`                    | unset                                | `true` skips Redis (dev only)  |
 
 ---
 
-## 🐛 Bilinen kısıtlar
+## Technology choices and rationale
 
-- Sadece **dijital PDF** (taranmış/imaj PDF'ler için OCR gerekli — `docling` veya `marker` eklenebilir)
-- **Auth yok** — şu an tüm dökümanlar ortak. Multi-tenant için JWT eklenmeli.
-- **Ingestion senkron** — büyük PDF'ler için arka plan job queue (arq) gerekli.
-- **Rate limiting yok** — OpenRouter limitlerine tabi.
+- **BGE-small over BGE-M3**: M3 is 2.3 GB and takes 10+ minutes to download; small is 120 MB and downloads in 1-2 minutes. Turkish quality is weaker but sufficient for demonstration. Switching to `intfloat/multilingual-e5-base` is a one-line config change.
 
----
+- **OpenRouter over direct OpenAI**: the OpenAI SDK is OpenRouter-compatible via `base_url` override, giving us the option to swap providers (Anthropic, Mistral, local) without code changes. No OpenAI account balance required.
 
-## 🗺️ Yol haritası
+- **Chroma over Qdrant/Pinecone**: zero devops, persistent by default, sufficient for a single-node demo. Migration to Qdrant self-hosted is straightforward when horizontal scaling becomes necessary.
 
-- [ ] OCR (taranmış PDF'ler için)
-- [ ] JWT auth + kullanıcı başına döküman izolasyonu
-- [ ] `arq` ile async ingestion (queue + progress)
-- [ ] Daha iyi Türkçe embedding (`multilingual-e5-base` switch)
-- [ ] Qdrant'a migration rehberi
-- [ ] Döküman listesi sayfası (silme/yeniden adlandırma)
-- [ ] Streaming iptal butonu (AbortController hazır)
+- **Recursive splitter over semantic chunking**: language-agnostic, fast, predictable. Semantic chunking via LlamaIndex can be added later if retrieval quality degrades on long, structured documents.
+
+- **Celery over FastAPI BackgroundTasks**: BackgroundTasks die with the request process and do not survive restarts. Celery persists tasks in Redis, so a worker crash mid-ingestion is recoverable via task retry.
+
+- **SSE over WebSocket**: chat is a one-way stream from server to client. SSE works over plain HTTP, supports automatic browser reconnection, and is sufficient for token streaming.
 
 ---
 
-## 📄 Lisans
+## Known limitations
+
+- **Digital PDFs only.** Scanned documents require OCR; candidates are `docling` and `marker`.
+- **No authentication.** All uploaded documents are visible to any client of the same backend instance. Multi-tenancy requires JWT + per-user `document_id` filtering.
+- **Single worker.** `worker_concurrency=1` because embedding is CPU-bound; raising this without sufficient cores causes thrashing. A GPU backend would unlock parallelism.
+- **No rate limiting.** OpenRouter's per-key limits are the only constraint. Add `slowapi` or `fastapi-limiter` if exposing publicly.
+- **Embedding model is fixed per process.** Switching models at runtime requires a worker restart.
+
+---
+
+## Roadmap
+
+- [ ] OCR support for scanned PDFs
+- [ ] JWT auth and per-user document isolation
+- [ ] Document listing page (browse, delete, rename)
+- [ ] Streaming cancellation button (AbortController already wired)
+- [ ] Better multilingual embedding (`intfloat/multilingual-e5-base`)
+- [ ] Qdrant migration guide for production scale
+- [ ] Evaluation harness (RAGAS or custom) for retrieval quality
+
+---
+
+## License
 
 MIT

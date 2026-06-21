@@ -5,6 +5,24 @@ export type IngestResponse = {
   chunks: number;
 };
 
+// Yeni: async ingestion (Celery) yaniti
+export type JobAccepted = {
+  job_id: string;
+  document_id: string;
+  filename: string;
+  status_url: string;
+};
+
+// Job polling sonucu
+export type JobStatus = {
+  job_id: string;
+  state: "PENDING" | "STARTED" | "PROGRESS" | "SUCCESS" | "FAILURE";
+  stage: string | null;
+  percent: number | null;
+  result: IngestResponse | null;
+  error: string | null;
+};
+
 export type SearchHit = {
   text: string;
   page_number: number | null;

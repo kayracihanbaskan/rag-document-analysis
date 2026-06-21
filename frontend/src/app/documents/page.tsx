@@ -2,30 +2,66 @@
 
 import { motion, AnimatePresence } from "framer-motion";
 import { useRouter } from "next/navigation";
-import { useState, type DragEvent } from "react";
+import { useEffect, useRef, useState, type DragEvent } from "react";
 
-import { uploadDocument } from "@/lib/api";
+import { getJobStatus, uploadDocument } from "@/lib/api";
 import { addDocument } from "@/lib/storage";
+import type { JobStatus } from "@/lib/types";
 
-type UploadState = "idle" | "uploading" | "success" | "error";
+// Ingestion durumlarina gore UI metni
+function describeJob(s: JobStatus): { label: string; tone: "wait" | "ok" | "err" } {
+  if (s.state === "FAILURE") return { label: s.error || "Hata olustu", tone: "err" };
+  if (s.state === "SUCCESS") {
+    const r = s.result;
+    return { label: `${r?.filename}: ${r?.pages} sayfa, ${r?.chunks} chunk`, tone: "ok" };
+  }
+  if (s.state === "PROGRESS") return { label: s.stage || "Isleniyor...", tone: "wait" };
+  if (s.state === "STARTED") return { label: "Worker basladi...", tone: "wait" };
+  return { label: "Kuyruga alindi...", tone: "wait" };
+}
 
 export default function DocumentsPage() {
   const router = useRouter();
   const [file, setFile] = useState<File | null>(null);
-  const [state, setState] = useState<UploadState>("idle");
-  const [message, setMessage] = useState("");
   const [dragOver, setDragOver] = useState(false);
+  const [job, setJob] = useState<JobStatus | null>(null);
+  const [errMsg, setErrMsg] = useState<string | null>(null);
+  const abortRef = useRef<AbortController | null>(null);
+
+  // Polling: job SUCCESS veya FAILURE olunca durur
+  useEffect(() => {
+    if (!job || job.state === "SUCCESS" || job.state === "FAILURE") return;
+    const t = setInterval(async () => {
+      try {
+        const s = await getJobStatus(job.job_id);
+        setJob(s);
+        if (s.state === "SUCCESS" && s.result) {
+          addDocument({
+            id: s.result.document_id,
+            filename: s.result.filename,
+            pages: s.result.pages,
+            chunks: s.result.chunks,
+            uploadedAt: new Date().toISOString(),
+          });
+          // Chat'e otomatik gec (kullanici mesaji okusun diye 800ms bekle)
+          setTimeout(() => router.push("/chat"), 800);
+        }
+      } catch {
+        // backend gecici olarak cevap vermezse yeniden dene
+      }
+    }, 1000);
+    return () => clearInterval(t);
+  }, [job, router]);
 
   function handleFile(f: File | undefined | null) {
     if (!f) return;
     if (!f.name.toLowerCase().endsWith(".pdf")) {
-      setState("error");
-      setMessage("Sadece PDF dosyasi kabul edilir.");
+      setErrMsg("Sadece PDF dosyasi kabul edilir.");
       return;
     }
     setFile(f);
-    setState("idle");
-    setMessage("");
+    setJob(null);
+    setErrMsg(null);
   }
 
   function onDrop(e: DragEvent<HTMLLabelElement>) {
@@ -35,26 +71,26 @@ export default function DocumentsPage() {
   }
 
   async function onUpload() {
-    if (!file) return;
-    setState("uploading");
-    setMessage("PDF okunuyor, chunk'lanıyor ve embedding'leniyor...");
+    if (!file || job) return;
+    setErrMsg(null);
     try {
-      const result = await uploadDocument(file);
-      addDocument({
-        id: result.document_id,
-        filename: result.filename,
-        pages: result.pages,
-        chunks: result.chunks,
-        uploadedAt: new Date().toISOString(),
+      const accepted = await uploadDocument(file);
+      // Henuz polling baslamadi; PENDING state'ini goster
+      setJob({
+        job_id: accepted.job_id,
+        state: "PENDING",
+        stage: "Kuyruga alindi, worker bekleniyor...",
+        percent: null,
+        result: null,
+        error: null,
       });
-      setState("success");
-      setMessage(`${result.filename}: ${result.pages} sayfa, ${result.chunks} chunk.`);
-      setTimeout(() => router.push("/chat"), 900);
     } catch (err) {
-      setState("error");
-      setMessage(`Hata: ${(err as Error).message}`);
+      setErrMsg((err as Error).message);
     }
   }
+
+  const busy = !!job && job.state !== "SUCCESS" && job.state !== "FAILURE";
+  const jobDesc = job ? describeJob(job) : null;
 
   return (
     <main className="mx-auto max-w-2xl px-6 py-12">
@@ -63,10 +99,10 @@ export default function DocumentsPage() {
         animate={{ opacity: 1, y: 0 }}
         className="text-3xl font-semibold tracking-tight"
       >
-        PDF Yükle
+        PDF Yukle
       </motion.h1>
       <p className="mt-2 text-muted">
-        Digital bir PDF sec (taranmis/imaj PDF'ler icin OCR gerekli, simdilik desteklenmiyor).
+        Digital bir PDF sec. Ingestion arka planda calisir, ilerlemeyi asagidan takip edebilirsin.
       </p>
 
       <motion.div
@@ -86,18 +122,16 @@ export default function DocumentsPage() {
             dragOver
               ? "border-[var(--accent)] bg-[var(--accent)]/5 scale-[1.02]"
               : "border-border hover:border-border-strong"
-          }`}
+          } ${busy ? "pointer-events-none opacity-50" : ""}`}
         >
           <input
             type="file"
             accept="application/pdf"
             onChange={(e) => handleFile(e.target.files?.[0])}
             className="hidden"
+            disabled={busy}
           />
-          <motion.div
-            animate={{ y: dragOver ? -4 : 0 }}
-            className="text-4xl"
-          >
+          <motion.div animate={{ y: dragOver ? -4 : 0 }} className="text-4xl">
             {file ? "📄" : "📥"}
           </motion.div>
           <p className="mt-3 font-medium">
@@ -110,24 +144,22 @@ export default function DocumentsPage() {
 
         <div className="mt-5 flex items-center gap-3">
           <motion.button
-            whileHover={{ scale: file && state !== "uploading" ? 1.02 : 1 }}
+            whileHover={{ scale: !file || busy ? 1 : 1.02 }}
             whileTap={{ scale: 0.98 }}
-            disabled={!file || state === "uploading"}
+            disabled={!file || busy}
             onClick={onUpload}
             className="gradient-border glow-on-hover relative inline-flex items-center gap-2 px-5 py-2.5 font-medium text-text disabled:cursor-not-allowed disabled:opacity-40"
           >
-            {state === "uploading" && (
-              <Spinner />
-            )}
-            {state === "success" ? "Yuklendi" : state === "uploading" ? "Isleniyor..." : "Yukle"}
+            {busy && <Spinner />}
+            {busy ? "Isleniyor..." : "Yukle"}
           </motion.button>
 
-          {file && state !== "uploading" && (
+          {file && !busy && (
             <button
               onClick={() => {
                 setFile(null);
-                setState("idle");
-                setMessage("");
+                setJob(null);
+                setErrMsg(null);
               }}
               className="text-sm text-muted hover:text-text"
             >
@@ -136,24 +168,56 @@ export default function DocumentsPage() {
           )}
         </div>
 
+        {/* Job durumu: ilerleme cubugu + mesaj */}
         <AnimatePresence mode="wait">
-          {message && (
-            <motion.p
-              key={state + message}
+          {job && jobDesc && (
+            <motion.div
+              key={job.state + (job.percent ?? "")}
               initial={{ opacity: 0, y: 5 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -5 }}
-              className={`mt-4 text-sm ${
-                state === "error"
-                  ? "text-[var(--danger)]"
-                  : state === "success"
-                    ? "text-[var(--success)]"
-                    : "text-muted"
-              }`}
+              className="mt-5 rounded-xl border border-border bg-surface p-4"
             >
-              {state === "success" && "✓ "}
-              {state === "error" && "✗ "}
-              {message}
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-mono text-muted">{job.state}</span>
+                {job.percent !== null && (
+                  <span className="text-muted">%{job.percent}</span>
+                )}
+              </div>
+              <p className={`mt-2 text-sm ${jobDesc.tone === "err" ? "text-[var(--danger)]" : jobDesc.tone === "ok" ? "text-[var(--success)]" : "text-text"}`}>
+                {jobDesc.tone === "ok" && "✓ "}
+                {jobDesc.tone === "err" && "✗ "}
+                {jobDesc.label}
+              </p>
+              {/* Determinate progress bar (varsa yuzde), indeterminate spinner (yoksa) */}
+              <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-white/5">
+                {job.percent !== null ? (
+                  <motion.div
+                    className="h-full bg-gradient-to-r from-[var(--accent)] to-[var(--accent-2)]"
+                    initial={{ width: 0 }}
+                    animate={{ width: `${job.percent}%` }}
+                    transition={{ duration: 0.4 }}
+                  />
+                ) : (
+                  <motion.div
+                    className="h-full w-1/3 bg-gradient-to-r from-[var(--accent)] to-[var(--accent-2)]"
+                    animate={{ x: ["-100%", "300%"] }}
+                    transition={{ repeat: Infinity, duration: 1.4, ease: "easeInOut" }}
+                  />
+                )}
+              </div>
+            </motion.div>
+          )}
+
+          {errMsg && (
+            <motion.p
+              key="err"
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              className="mt-4 text-sm text-[var(--danger)]"
+            >
+              ✗ {errMsg}
             </motion.p>
           )}
         </AnimatePresence>
@@ -164,26 +228,9 @@ export default function DocumentsPage() {
 
 function Spinner() {
   return (
-    <svg
-      className="h-4 w-4 animate-spin"
-      viewBox="0 0 24 24"
-      fill="none"
-      xmlns="http://www.w3.org/2000/svg"
-    >
-      <circle
-        cx="12"
-        cy="12"
-        r="10"
-        stroke="currentColor"
-        strokeOpacity="0.25"
-        strokeWidth="3"
-      />
-      <path
-        d="M22 12a10 10 0 0 1-10 10"
-        stroke="currentColor"
-        strokeWidth="3"
-        strokeLinecap="round"
-      />
+    <svg className="h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none">
+      <circle cx="12" cy="12" r="10" stroke="currentColor" strokeOpacity="0.25" strokeWidth="3" />
+      <path d="M22 12a10 10 0 0 1-10 10" stroke="currentColor" strokeWidth="3" strokeLinecap="round" />
     </svg>
   );
 }
