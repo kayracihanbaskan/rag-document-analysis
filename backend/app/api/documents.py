@@ -27,7 +27,7 @@ from app.schemas.documents import (
     SearchResponse,
 )
 from app.services.embedder import BGEEmbedder, get_embedder
-from app.services.ingestion import IngestionService
+from app.services.guards import is_user_input_safe
 from app.services.llm import OpenRouterLLM, get_llm
 from app.services.rag import RagService
 from app.services.vector_store import VectorStore
@@ -141,10 +141,6 @@ async def get_job_status(job_id: str) -> JobStatus:
     return JobStatus(**payload)
 
 
-# ---------- Eski ingestion endpoint (kaldirildi; artik /upload async) ----------
-# IngestionService direkt kullanilmiyor; sadece task uzerinden erisiliyor.
-
-
 @router.get("/documents/search", response_model=SearchResponse)
 async def search(
     q: str,
@@ -170,6 +166,10 @@ async def chat(
 ) -> ChatResponse:
     if not payload.question.strip():
         raise HTTPException(status_code=400, detail="Soru bos olamaz.")
+    # Prompt injection guard: supheli kullanici girdisi
+    safe, reason = is_user_input_safe(payload.question)
+    if not safe:
+        raise HTTPException(status_code=400, detail=reason or "Gecersiz soru.")
     chunks, answer = service.answer(
         payload.question, payload.document_id, payload.top_k
     )
@@ -186,6 +186,10 @@ async def chat_stream(
 ):
     if not payload.question.strip():
         raise HTTPException(status_code=400, detail="Soru bos olamaz.")
+    # Prompt injection guard: supheli kullanici girdisi
+    safe, reason = is_user_input_safe(payload.question)
+    if not safe:
+        raise HTTPException(status_code=400, detail=reason or "Gecersiz soru.")
     chunks, token_iter = service.stream(
         payload.question, payload.document_id, payload.top_k
     )
