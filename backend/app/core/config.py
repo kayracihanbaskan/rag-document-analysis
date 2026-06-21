@@ -18,8 +18,8 @@ class Settings(BaseSettings):
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     llm_model: str = "openai/gpt-4o-mini"
 
-    # --- Embedding (lokal BGE-M3) ---
-    bge_model_name: str = "BAAI/bge-m3"
+    # --- Embedding (lokal BGE-small) ---
+    bge_model_name: str = "BAAI/bge-small-en-v1.5"
     bge_device: str = "cpu"
     bge_max_length: int = 512
     bge_batch_size: int = 16
@@ -35,6 +35,12 @@ class Settings(BaseSettings):
     # --- Upload ---
     upload_dir: Path = Path("./data/uploads")
     max_upload_mb: int = 20
+
+    # --- Celery / Redis (async ingestion queue) ---
+    celery_broker_url: str = "redis://127.0.0.1:6379/0"
+    celery_result_backend: str = "redis://127.0.0.1:6379/1"
+    # Task sonuclarini ne kadar tutalim (1 saat); sonra Redis otomatik temizler
+    celery_result_expires_seconds: int = 3600
 
 
 @lru_cache

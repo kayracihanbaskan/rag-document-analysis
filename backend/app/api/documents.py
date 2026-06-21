@@ -1,22 +1,28 @@
-# HTTP katmani: 4 endpoint
-# - POST /documents/upload    -> PDF yukle, parse et, embed'le, Chroma'ya yaz
-# - GET  /documents/search    -> Metin sorgusu, top-K benzer chunk dondur
-# - POST /documents/chat      -> Retrieval + LLM tam yanit (kaynak dahil)
-# - POST /documents/chat/stream -> Retrieval + LLM SSE (kaynak + token event'leri)
+# HTTP katmani: 5 endpoint
+# - POST /documents/upload        -> PDF yukle, ingestion task kuyruga at, 202 doner
+# - GET  /jobs/{job_id}           -> Task ilerlemesini sorgula (polling)
+# - GET  /documents/search        -> Metin sorgusu, top-K benzer chunk dondur
+# - POST /documents/chat          -> Retrieval + LLM tam yanit (kaynak dahil)
+# - POST /documents/chat/stream   -> Retrieval + LLM SSE (kaynak + token event'leri)
 
 import json
 import shutil
 import uuid
+from pathlib import Path
 
+from celery.result import AsyncResult
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
+from app.celery_app import celery_app
 from app.core.config import Settings, get_settings
 from app.schemas.documents import (
     ChatRequest,
     ChatResponse,
     ChatSource,
     IngestResponse,
+    JobAccepted,
+    JobStatus,
     SearchHit,
     SearchResponse,
 )
@@ -26,29 +32,21 @@ from app.services.llm import OpenRouterLLM, get_llm
 from app.services.rag import RagService
 from app.services.vector_store import VectorStore
 
-router = APIRouter(prefix="/documents", tags=["documents"])
+router = APIRouter(tags=["documents"])
 
+
+# ---------- Dependency helpers ----------
 
 def get_vector_store(settings: Settings = Depends(get_settings)) -> VectorStore:
     return VectorStore(settings)
 
 
-def get_embedder_dep(
-    settings: Settings = Depends(get_settings),
-) -> BGEEmbedder:
+def get_embedder_dep(settings: Settings = Depends(get_settings)) -> BGEEmbedder:
     return get_embedder(settings)
 
 
 def get_llm_dep(settings: Settings = Depends(get_settings)) -> OpenRouterLLM:
     return get_llm(settings)
-
-
-def get_ingestion_service(
-    settings: Settings = Depends(get_settings),
-    embedder: BGEEmbedder = Depends(get_embedder_dep),
-    vector_store: VectorStore = Depends(get_vector_store),
-) -> IngestionService:
-    return IngestionService(settings, embedder, vector_store)
 
 
 def get_rag_service(
@@ -60,12 +58,21 @@ def get_rag_service(
     return RagService(settings, embedder, llm, vector_store)
 
 
-@router.post("/upload", response_model=IngestResponse)
+# ---------- Endpoints ----------
+
+@router.post(
+    "/documents/upload",
+    response_model=JobAccepted,
+    status_code=202,
+)
 async def upload_document(
     file: UploadFile = File(...),
     settings: Settings = Depends(get_settings),
-    service: IngestionService = Depends(get_ingestion_service),
-) -> IngestResponse:
+) -> JobAccepted:
+    """PDF'i kaydet, ingestion task'ini kuyruga at, hemen 202 dondur.
+
+    Istemci status_url ile polling yaparak ilerlemeyi takip eder.
+    """
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Sadece PDF dosyalari kabul edilir.")
 
@@ -76,20 +83,69 @@ async def upload_document(
     try:
         with target.open("wb") as out:
             shutil.copyfileobj(file.file, out)
-        result = service.ingest(document_id, file.filename, target)
-    except ValueError as exc:
-        target.unlink(missing_ok=True)
-        raise HTTPException(status_code=400, detail=str(exc))
-    except Exception:
-        target.unlink(missing_ok=True)
-        raise
     finally:
         await file.close()
 
-    return IngestResponse(**result)
+    # Ingestion task'ini Celery kuyruguna at (worker arka planda calistiracak)
+    from app.tasks.ingestion import ingest_pdf  # lazy import: worker baslamadan yuklenmesin
+
+    async_result = ingest_pdf.delay(document_id, file.filename, str(target))
+    job_id = async_result.id
+
+    return JobAccepted(
+        job_id=job_id,
+        document_id=document_id,
+        filename=file.filename,
+        status_url=f"/jobs/{job_id}",
+    )
 
 
-@router.get("/search", response_model=SearchResponse)
+@router.get("/jobs/{job_id}", response_model=JobStatus)
+async def get_job_status(job_id: str) -> JobStatus:
+    """Task ilerlemesini sorgula (frontend polling icin).
+
+    Celery state'leri:
+    - PENDING  : kuyruga alindi, henuz baslamadi
+    - STARTED  : worker aldi, basladi
+    - PROGRESS : ara bilgi (stage + percent)
+    - SUCCESS  : tamam, result icinde ingestion sonucu
+    - FAILURE  : hata, error icinde mesaj
+    """
+    result = AsyncResult(job_id, app=celery_app)
+
+    state = result.state  # "PENDING", "PROGRESS", "SUCCESS", "FAILURE", ...
+    payload: dict = {
+        "job_id": job_id,
+        "state": state,
+        "stage": None,
+        "percent": None,
+        "result": None,
+        "error": None,
+    }
+
+    if state == "PROGRESS":
+        info = result.info or {}
+        payload["stage"] = info.get("stage")
+        payload["percent"] = info.get("percent")
+    elif state == "SUCCESS":
+        # result.get() blocking olabilir ama SUCCESS durumunda zaten cache'li
+        try:
+            payload["result"] = result.get(timeout=1.0)
+        except Exception as exc:
+            payload["error"] = f"Result alinamadi: {exc}"
+    elif state == "FAILURE":
+        # info exception objesi olabilir; string'e cevir
+        info = result.info
+        payload["error"] = str(info) if info else "Bilinmeyen hata"
+
+    return JobStatus(**payload)
+
+
+# ---------- Eski ingestion endpoint (kaldirildi; artik /upload async) ----------
+# IngestionService direkt kullanilmiyor; sadece task uzerinden erisiliyor.
+
+
+@router.get("/documents/search", response_model=SearchResponse)
 async def search(
     q: str,
     top_k: int = 5,
@@ -107,7 +163,7 @@ async def search(
     )
 
 
-@router.post("/chat", response_model=ChatResponse)
+@router.post("/documents/chat", response_model=ChatResponse)
 async def chat(
     payload: ChatRequest,
     service: RagService = Depends(get_rag_service),
@@ -123,7 +179,7 @@ async def chat(
     )
 
 
-@router.post("/chat/stream")
+@router.post("/documents/chat/stream")
 async def chat_stream(
     payload: ChatRequest,
     service: RagService = Depends(get_rag_service),
@@ -134,7 +190,6 @@ async def chat_stream(
         payload.question, payload.document_id, payload.top_k
     )
 
-    # Once kaynaklar tek seferde, sonra token token SSE.
     sources_payload = [
         {
             "text": c.text,
