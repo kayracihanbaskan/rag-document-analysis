@@ -1,24 +1,29 @@
+# Backend bagimliliklari. Pinli versiyonlar Python 3.11 ile test edildi.
+
+# --- Web framework ---
 fastapi==0.115.6
 uvicorn[standard]==0.32.1
 python-multipart==0.0.20
 pydantic==2.10.4
 pydantic-settings==2.7.0
 
-# PDF parsing
+# --- PDF & metin islem ---
 pymupdf==1.25.1
-
-# Token sayma (ileride chunk_size optimizasyonu icin)
 tiktoken==0.8.0
-
-# OpenAI SDK; biz OpenRouter'a baglaniyoruz (base_url degisikligi yeterli).
-openai==1.61.1
-
-# Vector DB
-chromadb==0.5.23
-
-# Recursive karakter splitter
 langchain-text-splitters==0.3.5
 
-# Lokal embedding (BGE-small) + torch
+# --- LLM (OpenRouter - OpenAI uyumlu SDK) ---
+openai==1.61.1
+
+# --- Vector DB ---
+chromadb==0.5.23
+
+# --- Lokal embedding (BGE-small) + torch ---
 sentence-transformers==3.3.1
 torch==2.5.1
+
+# --- Async job queue ---
+# celery: distributed task queue (worker ayri process)
+# redis: broker (mesaj tasima) + result backend (sonuc saklama)
+celery[redis]==5.4.0
+redis==5.2.0
