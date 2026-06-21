@@ -1,10 +1,13 @@
 # Recursive karakter splitter: metni once paragraf, sonra satir, sonra cumle, sonra kelime
 # sinirlarindan keserek yaklasik chunk_size'a kadar parcalar.
 # Dil-bagimsiz calisir; Turkce icin ayarlanmis separator oncelikleri yeterli.
+# Cikti chunk'lar prompt injection kaliplarina karsi sanitize edilir.
 
 from dataclasses import dataclass
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+from app.services.guards import sanitize_chunk_for_storage
 
 
 @dataclass
@@ -30,9 +33,14 @@ def split_pages(
             text = piece.strip()
             if not text:
                 continue
+            # Prompt injection'a karsi ilk filtre (Chroma'ya yazmadan once).
+            sanitized = sanitize_chunk_for_storage(text)
+            if sanitized.blocked:
+                # Tamamen talimat yogunluklu veya asiri uzun chunk'i atla.
+                continue
             chunks.append(
                 Chunk(
-                    text=text,
+                    text=sanitized.text,
                     page_number=page.page_number,
                     chunk_index=chunk_index,
                 )
