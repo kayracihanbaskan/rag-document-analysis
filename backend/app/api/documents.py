@@ -30,6 +30,7 @@ from app.services.embedder import BGEEmbedder, get_embedder
 from app.services.guards import is_user_input_safe
 from app.services.llm import OpenRouterLLM, get_llm
 from app.services.rag import RagService
+from app.services.reranker import CrossEncoderReranker, get_reranker
 from app.services.vector_store import VectorStore
 
 router = APIRouter(tags=["documents"])
@@ -49,13 +50,23 @@ def get_llm_dep(settings: Settings = Depends(get_settings)) -> OpenRouterLLM:
     return get_llm(settings)
 
 
+def get_reranker_dep(
+    settings: Settings = Depends(get_settings),
+) -> CrossEncoderReranker:
+    # Reranker yuklenmesi 5-10sn surebilir (model ~1.1GB). Lazy tutmak yerine
+    # dependency seviyesinde bir kez olusturup FastAPI'nin singleton cache'ine
+    # birakiyoruz. Ilk istekte yuklenir, sonrakilerde anlik.
+    return get_reranker(settings)
+
+
 def get_rag_service(
     settings: Settings = Depends(get_settings),
     embedder: BGEEmbedder = Depends(get_embedder_dep),
     llm: OpenRouterLLM = Depends(get_llm_dep),
     vector_store: VectorStore = Depends(get_vector_store),
+    reranker: CrossEncoderReranker = Depends(get_reranker_dep),
 ) -> RagService:
-    return RagService(settings, embedder, llm, vector_store)
+    return RagService(settings, embedder, llm, vector_store, reranker)
 
 
 # ---------- Endpoints ----------
