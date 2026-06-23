@@ -11,48 +11,72 @@ A production-shaped RAG service built to study real-world trade-offs: async inge
 The system answers natural-language questions about a user's uploaded PDFs. It does not hallucinate freely — every answer is grounded in retrieved chunks, and the user can inspect which page and passage each citation came from.
 
 ```
-                                +-------------------+
-       +----------+    HTTP     |     FastAPI       |   OpenAI SDK    +------------+
-       |  Next.js | -----------> |  (uvicorn: 8000)  | ---------------> | OpenRouter |
-       | (3000)   |   /api/      |                   |                  |  gpt-4o-mini|
-       +----------+   backend    |  /documents/*     |                  +------------+
-            |                    |  /jobs/{id}       |
-            | SSE chat           |  /chat/stream     |   sentence-      +-----------+
-            v                    |                   | --transformers->|  Chroma   |
-       +----------+              |  worker:          |                  |  (volume) |
-       |  Browser | <----------- |  Celery (CPU)     |                  +-----------+
-       +----------+    job poll  |                   |
-                                +-------------------+
+                          +-------------------+        +-----------------+
+       +----------+        |   FastAPI (8000)  |        |  Celery worker  |
+       |  Next.js |  HTTP  |                   | .delay |  (CPU-bound)   |
+       |  (3000)  | <----> |  /documents/*     | <-----> |  BGE + parse   |
+       +----------+   |    |  /jobs/{id}       |        |  Chroma write  |
+            |         |    |  /chat, /chat/str |        +-----------------+
+            |         |    +---------+---------+               |
+            | SSE     |              |                         |
+            v         |              v                         v
+       (Browser)     |        Redis (6379)              Chroma (./data)
+                     |        DB0: broker               HNSW + cosine
+                     |        DB1: result
+                     |
+                     |        +----------------+
+                     |        |  Cross-Encoder  |  (retrieve-then-rerank)
+                     |        |  ms-marco       |   20 -> 5
+                     |        +----------------+
+                     |
+                     |   OpenAI-compatible SDK
+                     v
+                +-----------+
+                | OpenRouter|
+                | gpt-4o-mini (streaming)
+                +-----------+
 ```
 
 ### Pipeline
 
 **Ingestion (async via Celery + Redis):**
-1. `POST /documents/upload` saves the PDF and returns `202 Accepted` with a `job_id` immediately.
-2. A Celery worker picks up the task, parses pages with `pymupdf`, splits with `RecursiveCharacterTextSplitter`, embeds with `BAAI/bge-small-en-v1.5`, and writes vectors to Chroma with `document_id` metadata.
-3. The frontend polls `GET /jobs/{id}` for progress.
 
-**Retrieval + generation (sync, SSE):**
+1. `POST /documents/upload` saves the PDF and returns `202 Accepted` with a `job_id` immediately.
+2. A Celery worker picks up the task, parses pages with `pymupdf`, sanitizes each chunk against prompt-injection patterns, splits with `RecursiveCharacterTextSplitter`, embeds with `BAAI/bge-small-en-v1.5`, and writes vectors to Chroma with `document_id` metadata.
+3. The frontend polls `GET /jobs/{id}` for progress (`PENDING` → `STARTED` → `PROGRESS` → `SUCCESS`).
+
+**Retrieval + generation (sync, SSE) with reranker:**
+
 1. Question is embedded with the same BGE model.
-2. Top-K (default 5) chunks are fetched from Chroma, optionally filtered by `document_id`.
-3. Chunks are formatted into a context block; a system prompt instructs the model to answer only from the context.
-4. OpenRouter streams tokens back to the client over Server-Sent Events with three event types: `sources`, `token`, `done`.
+2. Top-K=20 chunks are fetched from Chroma (broad recall, optionally filtered by `document_id`).
+3. A cross-encoder reranker (`cross-encoder/ms-marco-MiniLM-L-2-v2`) re-scores those 20 chunks against the query and keeps the best 5. This two-stage pattern significantly improves relevance over embedding-only retrieval.
+4. The 5 chunks are formatted into a context block; a hardened system prompt instructs the model to answer only from the context and resist role overrides.
+5. OpenRouter streams tokens back to the client over Server-Sent Events with three event types: `sources`, `token`, `done`.
+6. The final response is filtered through an output sanitizer that masks any leaked API keys or system-prompt disclosure.
+
+**Security guardrails (three layers):**
+
+1. **Input sanitization at ingestion**: chunks with prompt-injection patterns, hidden API keys, or excessive padding are masked or dropped before reaching Chroma.
+2. **Input guardrails at chat**: the user's question is checked against a regex whitelist; suspicious commands (e.g., "reveal your system prompt") return `400`.
+3. **Hardened system prompt**: explicit rules forbid treating retrieved context as instructions, role changes, and system-prompt disclosure.
 
 ---
 
 ## Tech stack
 
-| Layer            | Choice                              | Why                                                 |
-|------------------|-------------------------------------|-----------------------------------------------------|
-| Backend          | FastAPI 0.115, Python 3.11          | Async, type-safe, OpenAPI built-in                  |
-| Job queue        | Celery 5 + Redis 7                  | Decouples ingestion from request lifecycle          |
-| PDF parsing      | `pymupdf`                           | Fast, no system deps, handles digital PDFs          |
-| Chunking         | `RecursiveCharacterTextSplitter`    | Language-agnostic, predictable boundaries           |
-| Embeddings       | `BAAI/bge-small-en-v1.5` (local)    | 120 MB, multilingual, no API cost                   |
-| Vector store     | ChromaDB (HNSW + cosine)            | Zero-config, persistent, metadata filtering         |
-| LLM              | OpenRouter `openai/gpt-4o-mini`     | OpenAI-compatible API, flexible model selection     |
-| Frontend         | Next.js 15 (App Router), React 19   | Streaming SSE proxy, server-side rewrite to backend |
-| Styling          | Tailwind + Framer Motion            | Glassmorphism, smooth state transitions             |
+| Layer            | Choice                                          | Why                                                 |
+|------------------|-------------------------------------------------|-----------------------------------------------------|
+| Backend          | FastAPI 0.115, Python 3.11                      | Async, type-safe, OpenAPI built-in                  |
+| Job queue        | Celery 5 + Redis 7                              | Decouples ingestion from request lifecycle          |
+| Embeddings       | `BAAI/bge-small-en-v1.5` (local)                | 120 MB, multilingual, no API cost                   |
+| Reranker         | `cross-encoder/ms-marco-MiniLM-L-2-v2` (local)  | 278 MB, ~400ms for 20 chunks, big retrieval boost   |
+| Vector store     | ChromaDB (HNSW + cosine)                        | Zero-config, persistent, metadata filtering         |
+| LLM              | OpenRouter `openai/gpt-4o-mini`                 | OpenAI-compatible API, flexible model selection     |
+| PDF parsing      | `pymupdf`                                       | Fast, no system deps, handles digital PDFs          |
+| Chunking         | `RecursiveCharacterTextSplitter`                | Language-agnostic, predictable boundaries           |
+| Security         | Three-layer guardrails (chunk/input/output)     | Prompt injection defense                            |
+| Frontend         | Next.js 15 (App Router), React 19               | Streaming SSE proxy, server-side rewrite to backend |
+| Styling          | Tailwind + Framer Motion                        | Glassmorphism, smooth state transitions             |
 
 ---
 
@@ -70,12 +94,14 @@ rag-document-analysis/
 │   │   ├── tasks/ingestion.py     # Celery ingestion task
 │   │   └── services/
 │   │       ├── pdf_parser.py      # pymupdf
-│   │       ├── chunker.py         # Recursive splitter
+│   │       ├── chunker.py         # Recursive splitter (+ guard)
 │   │       ├── embedder.py        # BGE-small
 │   │       ├── llm.py             # OpenRouter
 │   │       ├── vector_store.py    # Chroma adapter
 │   │       ├── ingestion.py       # PDF → DB pipeline
-│   │       └── rag.py             # retrieve → prompt → generate
+│   │       ├── rag.py             # retrieve + rerank + generate
+│   │       ├── reranker.py        # Cross-encoder rerank
+│   │       └── guards.py          # Prompt injection guards
 │   ├── data/                      # uploads + chroma (gitignored)
 │   ├── pyproject.toml
 │   ├── requirements.txt
@@ -97,6 +123,8 @@ rag-document-analysis/
 │   ├── package.json
 │   ├── tailwind.config.ts
 │   └── .env.example
+├── docs/
+│   └── ARCHITECTURE.md            # Deep technical report (gitignored)
 ├── docker-compose.yml             # Redis + backend + worker
 ├── .env.example
 └── README.md
@@ -108,7 +136,7 @@ rag-document-analysis/
 
 ### Option A: Docker (recommended)
 
-Single-command stack with Redis, backend API, and Celery worker. Frontend runs locally with `npm run dev` for fast iteration.
+`docker compose up` brings up Redis + FastAPI backend + Celery worker. Frontend runs locally with `npm run dev` for fast iteration.
 
 Prerequisites: Docker Desktop, Node.js 20+, an OpenRouter API key.
 
@@ -117,7 +145,7 @@ Prerequisites: Docker Desktop, Node.js 20+, an OpenRouter API key.
 copy .env.example .env
 # Edit .env and paste your OPENROUTER_API_KEY
 
-# 2. Start Redis + backend + worker
+# 2. Start Redis + backend + worker (3 services)
 docker compose up --build
 
 # 3. In a second terminal, start the frontend
@@ -131,7 +159,12 @@ npm run dev
 #    http://localhost:8000/docs (API docs)
 ```
 
-First build pulls `python:3.11-slim`, `node:20-alpine`, `redis:7-alpine` and downloads the BGE model (~120 MB). Expect 3-5 minutes on a cold cache; subsequent restarts take seconds.
+First build pulls `python:3.11-slim` and `redis:7-alpine`, then downloads the BGE embedding (~120 MB) and the ms-marco reranker (~278 MB) at build time. Expect 3-5 minutes on a cold cache; subsequent restarts take seconds.
+
+**Services in compose:**
+- `redis` — broker (DB 0) + result backend (DB 1)
+- `backend` — FastAPI on port 8000
+- `worker` — Celery consumer, same image as backend, runs `celery worker` instead of uvicorn
 
 Data persistence: Chroma vectors and uploaded PDFs live in the `rag-data` named volume. Survives container restarts. Remove with `docker compose down -v`.
 
@@ -233,6 +266,10 @@ All settings are read from environment variables, typically loaded from `backend
 | `BGE_MODEL_NAME`                  | `BAAI/bge-small-en-v1.5`             | Any sentence-transformers model |
 | `BGE_DEVICE`                      | `cpu`                                | `cpu` or `cuda`                |
 | `BGE_BATCH_SIZE`                  | `16`                                 |                                |
+| `RERANK_ENABLED`                  | `true`                               | Set `false` to disable         |
+| `RERANK_MODEL_NAME`               | `cross-encoder/ms-marco-MiniLM-L-2-v2` | See `services/reranker.py` for alternatives |
+| `RERANK_TOP_K`                    | `20`                                 | Broad retrieval candidate count|
+| `FINAL_TOP_K`                     | `5`                                  | Chunks sent to the LLM         |
 | `CHUNK_SIZE`                      | `800`                                | Character count                |
 | `CHUNK_OVERLAP`                   | `120`                                |                                |
 | `CHROMA_PERSIST_DIR`              | `./data/chroma`                      |                                |
@@ -240,10 +277,13 @@ All settings are read from environment variables, typically loaded from `backend
 | `CELERY_BROKER_URL`               | `redis://127.0.0.1:6379/0`           |                                |
 | `CELERY_RESULT_BACKEND`           | `redis://127.0.0.1:6379/1`           |                                |
 | `CELERY_EAGER`                    | unset                                | `true` skips Redis (dev only)  |
+| `ANONYMIZED_TELEMETRY`            | unset                                | `false` disables Chroma telemetry |
 
 ---
 
 ## Technology choices and rationale
+
+- **Cross-encoder reranker over single-stage retrieval**: BGE-small embedding finds broad matches but cannot tell whether a chunk actually answers the question. The two-stage pattern (retrieve 20 by cosine, rerank to 5) yields noticeably more relevant context without exploding latency (~400 ms for 20 chunks). Alternatives like `BAAI/bge-reranker-base` give marginal quality gains at 4× the model size.
 
 - **BGE-small over BGE-M3**: M3 is 2.3 GB and takes 10+ minutes to download; small is 120 MB and downloads in 1-2 minutes. Turkish quality is weaker but sufficient for demonstration. Switching to `intfloat/multilingual-e5-base` is a one-line config change.
 
@@ -278,6 +318,8 @@ All settings are read from environment variables, typically loaded from `backend
 - [ ] Better multilingual embedding (`intfloat/multilingual-e5-base`)
 - [ ] Qdrant migration guide for production scale
 - [ ] Evaluation harness (RAGAS or custom) for retrieval quality
+- [ ] LLM-as-judge layer (rejects subtle prompt injections before streaming)
+- [ ] Multi-worker scale-out (`docker compose up --scale worker=N`)
 
 ---
 
