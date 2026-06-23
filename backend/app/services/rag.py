@@ -1,9 +1,10 @@
 # RAG (Retrieval-Augmented Generation) servisi:
 # 1) Soruyu embedding'e cevir
-# 2) Chroma'dan en yakin K chunk'i getir
-# 3) Chunk'lari bir "baglam" metnine formatla
-# 4) System + user prompt ile LLM'e gonder
-# 5) Yanitla birlikte kaynaklari da dondur (frontend'in "N kaynak" detayini gostermesi icin)
+# 2) Chroma'dan genis K chunk al (rerank_top_k, default 20)
+# 3) Cross-encoder reranker ile en iyi N'i sec (final_top_k, default 5)
+# 4) Chunk'lari "baglam" metnine formatla
+# 5) System + user prompt ile LLM'e gonder
+# 6) Yanitla birlikte kaynaklari da dondur
 
 from collections.abc import Iterator
 
@@ -11,10 +12,10 @@ from app.core.config import Settings
 from app.services.embedder import BGEEmbedder
 from app.services.guards import sanitize_response
 from app.services.llm import OpenRouterLLM
+from app.services.reranker import CrossEncoderReranker
 from app.services.vector_store import RetrievedChunk, VectorStore
 
 # Sertlestirilmis system prompt (prompt injection'a karsi).
-# Baglamdaki metin ASLA talimat olarak yorumlanmaz; sadece bilgi kaynagi.
 SYSTEM_PROMPT = """\
 Sen bir dokuman analiz asistanisin. Gorevin SADECE asagidaki baglam \
 parcaciklarindaki bilgiye dayanarak kullanicinin sorusunu yanitlamaktir.
@@ -38,11 +39,43 @@ class RagService:
         embedder: BGEEmbedder,
         llm: OpenRouterLLM,
         vector_store: VectorStore,
+        reranker: CrossEncoderReranker | None = None,
     ) -> None:
         self._settings = settings
         self._embedder = embedder
         self._llm = llm
         self._vector_store = vector_store
+        self._reranker = reranker
+
+    def _retrieve(self, question: str, document_id: str | None) -> list[RetrievedChunk]:
+        """Iki asamalı retrieval: genis cosine arama + cross-encoder rerank.
+
+        Reranker yoksa veya disabled ise sadece cosine aramayi kullanir.
+        """
+        [query_embedding] = self._embedder.embed([question])
+
+        # Asama 1: cosine-based genis arama
+        initial_top_k = (
+            self._settings.rerank_top_k if self._reranker and self._reranker.is_available
+            and self._settings.rerank_enabled
+            else self._settings.final_top_k
+        )
+        candidates = self._vector_store.query(
+            embedding=query_embedding,
+            top_k=initial_top_k,
+            document_id=document_id,
+        )
+
+        # Asama 2: cross-encoder rerank (varsa)
+        if (
+            self._reranker
+            and self._reranker.is_available
+            and self._settings.rerank_enabled
+            and len(candidates) > self._settings.final_top_k
+        ):
+            return self._reranker.rerank(question, candidates, self._settings.final_top_k)
+
+        return candidates[: self._settings.final_top_k]
 
     def _format_context(self, chunks: list[RetrievedChunk]) -> str:
         return "\n\n".join(
@@ -53,10 +86,10 @@ class RagService:
     def answer(
         self, question: str, document_id: str | None, top_k: int
     ) -> tuple[list[RetrievedChunk], str]:
-        [query_embedding] = self._embedder.embed([question])
-        chunks = self._vector_store.query(
-            embedding=query_embedding, top_k=top_k, document_id=document_id
-        )
+        # Client top_k vermediyse config'den al
+        if top_k and top_k != self._settings.final_top_k:
+            self._settings.final_top_k = top_k
+        chunks = self._retrieve(question, document_id)
         context = self._format_context(chunks)
         user_prompt = f"Soru: {question}\n\nBaglam:\n{context}"
         raw_answer = self._llm.complete(SYSTEM_PROMPT, user_prompt)
@@ -65,15 +98,13 @@ class RagService:
     def stream(
         self, question: str, document_id: str | None, top_k: int
     ) -> tuple[list[RetrievedChunk], Iterator[str]]:
-        [query_embedding] = self._embedder.embed([question])
-        chunks = self._vector_store.query(
-            embedding=query_embedding, top_k=top_k, document_id=document_id
-        )
+        if top_k and top_k != self._settings.final_top_k:
+            self._settings.final_top_k = top_k
+        chunks = self._retrieve(question, document_id)
         context = self._format_context(chunks)
         user_prompt = f"Soru: {question}\n\nBaglam:\n{context}"
         raw_iter = self._llm.stream(SYSTEM_PROMPT, user_prompt)
-        # Output filter: her token'da uygulanamaz (token bazli regex kirilir);
-        # chunks listesini aynen dondurup token'lari oldugu gibi akit.
-        # Streaming bittikten sonra frontend tarafinda tam metin uzerinden
-        # sanitize etmek daha saglikli. Burada raw gonderiyoruz.
+        # Streaming'de token bazli output filter uygulanamaz; chunks metadata'sinda
+        # skor guncel, frontend bunu gostermesi icin yeterli. Tam metin sanitize'i
+        # /documents/chat (sync) endpoint'inde zaten uygulaniyor.
         return chunks, raw_iter

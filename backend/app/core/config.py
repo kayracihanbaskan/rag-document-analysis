@@ -24,6 +24,14 @@ class Settings(BaseSettings):
     bge_max_length: int = 512
     bge_batch_size: int = 16
 
+    # --- Reranker (lokal cross-encoder) ---
+    # Cross-encoder: sorgu + chunk birlikte degerlendirilir, embedding-based'ten
+    # daha dogru ama yavas. "Retrieve genis, rerank dar" pattern'i icin.
+    rerank_enabled: bool = True
+    rerank_model_name: str = "BAAI/bge-reranker-base"
+    rerank_top_k: int = 20       # Ilk retrieval'da kapsamli al
+    final_top_k: int = 5         # LLM'e gonderilecek nihai sayi
+
     # --- Vector store ---
     chroma_persist_dir: Path = Path("./data/chroma")
     chroma_collection: str = "documents"

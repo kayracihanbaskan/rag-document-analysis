@@ -23,9 +23,10 @@ RUN pip install --no-cache-dir \
 
 # BGE modelini build-time'da indir (container her acilista indirmesin)
 ARG BGE_MODEL_NAME=BAAI/bge-small-en-v1.5
+ARG RERANK_MODEL_NAME=cross-encoder/ms-marco-MiniLM-L-2-v2
 RUN mkdir -p /home/app/.cache/huggingface && \
     chown -R app:app /home/app/.cache && \
-    su app -c "python -c \"from sentence_transformers import SentenceTransformer; SentenceTransformer('${BGE_MODEL_NAME}')\""
+    su app -c "python -c \"from sentence_transformers import SentenceTransformer; SentenceTransformer('${BGE_MODEL_NAME}'); from sentence_transformers import CrossEncoder; CrossEncoder('${RERANK_MODEL_NAME}')\""
 
 # Uygulama kodu
 COPY --chown=app:app app /app/app
